@@ -2,7 +2,7 @@
 
 ![Our workflow](image/workflow.png)
 
-This repo contains code for Iron Sharpens Iron: Defending Against Attacks in Machine-Generated Text Detection with Adversarial Training (https://arxiv.org/abs/2502.12734, submitted to ACL'25) by Yuanfan Li*, Zhaohan Zhang*, Chengzhengxu Li*, Chao Shen, Xiaoming Liu. In this codebase, we provide a adversarial training framework named GREATER, to help the detector defend adversarial attacks. The GREATER consists of two key components: an adversary GREATER-A and a detector GREATER-D. Our experimental results across 9 text perturbation strategies and 5 adversarial attacks show that our GREATER-D reduces the Attack Success Rate (ASR) by 0.67% compared with SOTA defense methods while our GREATER-A is demonstrated to be more effective and efficient than SOTA attack approaches.
+This repo contains code for Iron Sharpens Iron: Defending Against Attacks in Machine-Generated Text Detection with Adversarial Training (https://arxiv.org/abs/2502.12734, submitted to ACL'25) by Yuanfan Li*, Zhaohan Zhang*, Chengzhengxu Li*, Chao Shen, Xiaoming Liu. In this codebase, we provide a adversarial training framework named GREATER, to help the detector defend adversarial attacks. The GREATER consists of two key components: an adversary GREATER-A and a detector GREATER-D. Our experimental results across 10 text perturbation strategies and 6 adversarial attacks show that our GREATER-D reduces the Attack Success Rate (ASR) by 0.67% compared with SOTA defense methods while our GREATER-A is demonstrated to be more effective and efficient than SOTA attack approaches.
 
 ## Environment
 
