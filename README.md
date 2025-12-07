@@ -2,6 +2,11 @@
 
 ![Our workflow](image/workflow.png)
 
+[News]
+
+* [2025/12/8] This repo will be merged into a new repo soon. In the new repo, you can call our GREATER detector easily, with many existing MGT detectors.
+* [2025/5/15] 🎉Our paper was accepted by ACL 2025 Main Conference!
+
 This repo contains code for Paper `Iron Sharpens Iron: Defending Against Attacks in Machine-Generated Text Detection with Adversarial Training` (https://aclanthology.org/2025.acl-long.155/, accepted by ACL'25 Main Conference) by Yuanfan Li, Zhaohan Zhang, Chengzhengxu Li, Chao Shen and Xiaoming Liu. In this codebase, we provide a adversarial training framework named GREATER, to help the detector defend adversarial attacks. The GREATER consists of two key components: an adversary GREATER-A and a detector GREATER-D. Our experimental results across 10 text perturbation strategies and 6 adversarial attacks show that our GREATER-D reduces the Attack Success Rate (ASR) by 0.67% compared with SOTA defense methods while our GREATER-A is demonstrated to be more effective and efficient than SOTA attack approaches.
 
 ## Environment
