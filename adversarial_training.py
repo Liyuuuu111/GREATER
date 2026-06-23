@@ -50,33 +50,119 @@ def is_readable(token):
 def clean_special_tokens(text):
     return text.replace("</s>", "").replace("<s>", "").strip()
 
-def generate_perturbed_embeddings_on_selected_tokens(model, input_ids, selected_token_indices, epsilon=0.3, xi=1e-2, ip=1):
-    input_ids = input_ids[:, :512]
-    # roberta 模型主体
-    inputs_embeds = model.roberta.embeddings(input_ids=input_ids.to(device))
-    d = torch.rand_like(inputs_embeds).sub(0.5).to(device)
-    d = xi * d / (torch.norm(d, p=2, dim=-1, keepdim=True) + 1e-8)
-    d.requires_grad_()
+def _normalize_selected_token_perturbation(d, selected_token_indices, eps=1e-8):
+    """
+    Normalize perturbation on selected tokens only.
+    d: [batch, seq_len, hidden]
+    selected_token_indices: [k]
+    """
+    d_new = torch.zeros_like(d)
+    if selected_token_indices.numel() == 0:
+        return d_new
+
+    selected_d = d[:, selected_token_indices, :]
+    selected_norm = torch.norm(selected_d, p=2, dim=-1, keepdim=True)
+    selected_d = selected_d / (selected_norm + eps)
+    d_new[:, selected_token_indices, :] = selected_d
+    return d_new
+
+
+def generate_perturbed_embeddings_on_selected_tokens(
+    model,
+    input_ids,
+    attention_mask,
+    selected_token_indices,
+    epsilon=0.3,
+    xi=1e-2,
+    ip=1,
+    max_length=512,
+):
+    model.eval()
+
+    input_ids = input_ids[:, :max_length].to(device)
+    attention_mask = attention_mask[:, :max_length].to(device)
+
+    if not torch.is_tensor(selected_token_indices):
+        selected_token_indices = torch.tensor(
+            selected_token_indices, dtype=torch.long, device=device
+        )
+    else:
+        selected_token_indices = selected_token_indices.to(device).long()
+
+    selected_token_indices = selected_token_indices.view(-1)
+
+    seq_len = input_ids.size(1)
+    selected_token_indices = selected_token_indices[
+        (selected_token_indices >= 0) & (selected_token_indices < seq_len)
+    ]
+
+    # Clean embeddings. Detach because Eq.(5) only optimizes perturbation direction d.
+    inputs_embeds = model.roberta.embeddings(input_ids=input_ids).detach()
+
+    if selected_token_indices.numel() == 0:
+        return inputs_embeds
+
+    # Clean distribution P_sur(y | E).
+    # Since this is RobertaForMaskedLM, logits are vocabulary distributions
+    # at each token position: [batch, seq_len, vocab_size].
+    with torch.no_grad():
+        clean_outputs = model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        clean_logits = clean_outputs.logits[:, selected_token_indices, :]
+        probs_clean = F.softmax(clean_logits, dim=-1).detach()
+
+    # Initialize d from U(-0.5, 0.5), then normalize selected-token perturbation.
+    d = torch.empty_like(inputs_embeds).uniform_(-0.5, 0.5)
+    d = _normalize_selected_token_perturbation(d, selected_token_indices)
+    d = (xi * d).detach()
 
     for _ in range(ip):
-        perturbed_inputs_embeds = inputs_embeds.clone()
-        perturbed_inputs_embeds[:, selected_token_indices, :] += d[:, selected_token_indices, :]
-        outputs = model(inputs_embeds=perturbed_inputs_embeds)
-        probs_perturbed = F.softmax(outputs.logits, dim=-1)
-        kl_divergence = F.kl_div(probs_perturbed.log(), probs_perturbed, reduction='batchmean')
-        kl_divergence.backward()
-        if d.grad is not None:
-            grad = d.grad.clone()
-            grad_norm = torch.norm(grad[:, selected_token_indices, :], p=2, dim=-1, keepdim=True)
-            d_new = torch.zeros_like(d)
-            d_new[:, selected_token_indices, :] = grad[:, selected_token_indices, :] / (grad_norm + 1e-8)
-            d = d_new.detach()
-            d.requires_grad_()
-            model.zero_grad()
+        d.requires_grad_()
 
-    r_adv = epsilon * d[:, selected_token_indices, :] / (torch.norm(d[:, selected_token_indices, :], p=2, dim=-1, keepdim=True) + 1e-8)
-    perturbed_inputs_embeds = inputs_embeds.clone()
-    perturbed_inputs_embeds[:, selected_token_indices, :] += r_adv
+        perturbed_inputs_embeds = inputs_embeds + d
+
+        perturbed_outputs = model(
+            inputs_embeds=perturbed_inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        perturbed_logits = perturbed_outputs.logits[:, selected_token_indices, :]
+
+        # log Q, where Q = P_sur(y | \tilde{E})
+        log_probs_perturbed = F.log_softmax(perturbed_logits, dim=-1)
+
+        # KL(P_clean || P_perturbed).
+        # PyTorch F.kl_div(input, target) expects:
+        # input  = log-probabilities of Q
+        # target = probabilities of P
+        # so this computes sum P * (log P - log Q).
+        kl_divergence = F.kl_div(
+            log_probs_perturbed,
+            probs_clean,
+            reduction="batchmean",
+        )
+
+        grad = torch.autograd.grad(
+            kl_divergence,
+            d,
+            retain_graph=False,
+            create_graph=False,
+            only_inputs=True,
+        )[0]
+
+        d = _normalize_selected_token_perturbation(
+            grad.detach(),
+            selected_token_indices,
+        )
+
+        model.zero_grad(set_to_none=True)
+
+    r_adv = epsilon * d
+    perturbed_inputs_embeds = inputs_embeds + r_adv
+
     return perturbed_inputs_embeds
 
 class Generator(nn.Module):
@@ -86,6 +172,7 @@ class Generator(nn.Module):
         self.model = RobertaForMaskedLM.from_pretrained(model_name).to(device)
         self.tokenizer = RobertaTokenizer.from_pretrained(model_name)
         self.model.eval()
+
         for param in self.model.parameters():
             param.requires_grad = False
 
@@ -96,60 +183,116 @@ class Generator(nn.Module):
         ).to(device)
         self.importance_module.train()
 
-    def forward(self, input_text, max_query=100, epsilon=0.3):
+    def forward(self, input_text, max_query=100, epsilon=0.3, top_k_candidates=20):
         encoding = self.tokenizer.encode_plus(
             input_text,
             add_special_tokens=True,
             truncation=True,
             max_length=512,
+            return_attention_mask=True,
             return_tensors='pt'
         )
+
         input_ids = encoding['input_ids'].to(device)
         attention_mask = encoding['attention_mask'].to(device)
 
-        outputs = self.model.roberta(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True
-        )
-        hidden_states = outputs.last_hidden_state  # (1, seq_len, hidden_size)
+        with torch.no_grad():
+            outputs = self.model.roberta(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            hidden_states = outputs.last_hidden_state  # [1, seq_len, hidden_size]
 
-        importance_scores = self.importance_module(hidden_states).squeeze(-1)  # (1, seq_len)
+        # importance_module is trainable, so do not wrap this in no_grad.
+        importance_scores = self.importance_module(hidden_states).squeeze(-1)  # [1, seq_len]
         importance_scores = torch.sigmoid(importance_scores)
 
-        special_tokens_mask = self.tokenizer.get_special_tokens_mask(input_ids[0], already_has_special_tokens=True)
-        special_tokens_mask = torch.tensor(special_tokens_mask).unsqueeze(0).to(device)
-        importance_scores = importance_scores.masked_fill(special_tokens_mask.bool(), 0.0)
+        # Mask special tokens and padding tokens.
+        special_tokens_mask = self.tokenizer.get_special_tokens_mask(
+            input_ids[0].detach().cpu().tolist(),
+            already_has_special_tokens=True
+        )
+        special_tokens_mask = torch.tensor(
+            special_tokens_mask,
+            dtype=torch.bool,
+            device=device
+        ).unsqueeze(0)
 
-        k = max(int(max_query), 1)          # At least 1 query
-        _, selected_token_indices = torch.topk(importance_scores, k=k, dim=1)
-        selected_token_indices = selected_token_indices[0]
+        valid_token_mask = attention_mask.bool() & (~special_tokens_mask)
 
-        perturbed_inputs_embeds = generate_perturbed_embeddings_on_selected_tokens(
-            self.model, input_ids, selected_token_indices, epsilon=epsilon
+        # Use a large negative value instead of 0.0,
+        # otherwise masked tokens can still be selected when scores are small.
+        masked_importance_scores = importance_scores.masked_fill(
+            ~valid_token_mask,
+            -1e4
         )
 
+        num_valid_tokens = int(valid_token_mask.sum().item())
+        if num_valid_tokens == 0:
+            return [clean_special_tokens(input_text)], importance_scores, torch.tensor([], dtype=torch.long, device=device)
+
+        k = max(int(max_query), 1)
+        k = min(k, num_valid_tokens)
+
+        _, selected_token_indices = torch.topk(
+            masked_importance_scores,
+            k=k,
+            dim=1
+        )
+        selected_token_indices = selected_token_indices[0]  # [k]
+
+        perturbed_inputs_embeds = generate_perturbed_embeddings_on_selected_tokens(
+            self.model,
+            input_ids,
+            attention_mask,
+            selected_token_indices,
+            epsilon=epsilon
+        )
         with torch.no_grad():
-            outputs = self.model.lm_head(perturbed_inputs_embeds)
+            perturbed_outputs = self.model(
+                inputs_embeds=perturbed_inputs_embeds,
+                attention_mask=attention_mask,
+                return_dict=True
+            )
+            candidate_logits_all = perturbed_outputs.logits  # [1, seq_len, vocab_size]
+
             adversarial_ids = input_ids.clone()
+
             for idx in selected_token_indices:
-                candidate_logits = outputs[0, idx]
+                idx = int(idx.item())
+
+                candidate_logits = candidate_logits_all[0, idx]
                 probs = F.softmax(candidate_logits, dim=-1)
-                top_k_indices = torch.topk(probs, k=20).indices
+                top_k_indices = torch.topk(probs, k=top_k_candidates).indices
+
+                original_id = input_ids[0, idx].item()
                 found = False
+
                 for candidate_id in top_k_indices:
-                    candidate_token = self.tokenizer.convert_ids_to_tokens([candidate_id.item()])[0]
+                    candidate_id = int(candidate_id.item())
+
+                    # Avoid replacing with the same token.
+                    if candidate_id == original_id:
+                        continue
+
+                    candidate_token = self.tokenizer.convert_ids_to_tokens([candidate_id])[0]
+
                     if is_readable(candidate_token):
-                        adversarial_ids[0, idx] = candidate_id.item()
+                        adversarial_ids[0, idx] = candidate_id
                         found = True
                         break
+
                 if not found:
-                    adversarial_ids[0, idx] = input_ids[0, idx]
-        adversarial_text = clean_special_tokens(self.tokenizer.decode(adversarial_ids[0], skip_special_tokens=True))
+                    adversarial_ids[0, idx] = original_id
+
+        adversarial_text = clean_special_tokens(
+            self.tokenizer.decode(adversarial_ids[0], skip_special_tokens=True)
+        )
 
         return [adversarial_text], importance_scores, selected_token_indices
-
+        
 class Discriminator(nn.Module):
     def __init__(self, model_path):
         super(Discriminator, self).__init__()
@@ -206,7 +349,6 @@ class Discriminator(nn.Module):
     def classify(self, text):
         inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
         inputs = {k: v.to(device) for k,v in inputs.items()}
-        # 自动混合精度
         scaler = torch.cuda.amp.GradScaler()
         with torch.cuda.amp.autocast():
             outputs = self.model(**inputs)
@@ -345,16 +487,27 @@ for k_percent_value in k_percent_values:
                     total_attacks += 1
 
                     if use_gen and original_label == 1:
-                        for j in range(1, int(k_percent_value*len(text))):
+                        num_tokens = len(generator.tokenizer.tokenize(text))
+                        max_budget = max(1, int(k_percent_value * num_tokens))
+                    
+                        adversarial_text = text
+                        selected_token_indices = torch.tensor([], dtype=torch.long, device=device)
+                        importance_scores = torch.tensor([], device=device)
+                    
+                        for j in range(1, max_budget + 1):
                             adversarial_texts, importance_scores, selected_token_indices = generator(
-                                text, max_query=j
+                                text,
+                                max_query=j
                             )
                             adversarial_text = adversarial_texts[0]
+                    
                             adversarial_label, discriminator_logits_adv = discriminator.classify(adversarial_text)
                             attack_success = (adversarial_label != original_label)
+                    
                             if attack_success:
                                 break
-                        perturbation_rate = len(selected_token_indices) / len(generator.tokenizer.tokenize(text))
+                    
+                        perturbation_rate = len(selected_token_indices) / max(num_tokens, 1)
                         total_selected_tokens += len(selected_token_indices)
                     else:
                         adversarial_text = text
